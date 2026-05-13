@@ -1,0 +1,183 @@
+---
+- name: Configure Minecraft host
+  hosts: minecraft
+  become: true
+
+  vars:
+    aws_region: us-east-1
+    ecr_repository: ops3-minecraft-server
+    image_tag: v1.0.0
+    minecraft_version: "1.21.1"
+    minecraft_memory: "1G"
+    minecraft_motd: "strehloc's minecraft server"
+    data_dir: /opt/minecraft/data
+    backup_bucket: "ops3-minecraft-backups-413777480403"
+    backup_script_path: /usr/local/bin/minecraft-backup.sh
+
+  tasks:
+    - name: Install Docker prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - unzip
+        state: present
+        update_cache: true
+
+    - name: Add Docker GPG key
+      ansible.builtin.shell: |
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+          -o /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
+      args:
+        creates: /etc/apt/keyrings/docker.asc
+
+    - name: Add Docker apt repository
+      ansible.builtin.shell: |
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+          > /etc/apt/sources.list.d/docker.list
+      args:
+        creates: /etc/apt/sources.list.d/docker.list
+
+    - name: Install Docker Engine
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        update_cache: true
+
+    - name: Ensure Docker is running and enabled at boot
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Install AWS CLI v2
+      ansible.builtin.shell: |
+        cd /tmp
+        curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscli.zip
+        unzip -q awscli.zip
+        ./aws/install
+      args:
+        creates: /usr/local/bin/aws
+
+    - name: Install Python Docker SDK (required by community.docker)
+      ansible.builtin.apt:
+        name:
+          - python3-docker
+        state: present
+
+    - name: Look up the AWS account ID from the instance role
+      ansible.builtin.command:
+        cmd: aws sts get-caller-identity --query Account --output text
+      register: aws_account
+      changed_when: false
+
+    - name: Compose the ECR registry URL
+      ansible.builtin.set_fact:
+        ecr_registry: "{{ aws_account.stdout }}.dkr.ecr.{{ aws_region }}.amazonaws.com"
+
+    - name: Authenticate Docker to ECR
+      ansible.builtin.shell: |
+        aws ecr get-login-password --region {{ aws_region }} \
+          | docker login --username AWS --password-stdin {{ ecr_registry }}
+      changed_when: false
+
+    - name: Ensure the world-data directory exists
+      ansible.builtin.file:
+        path: "{{ data_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Check whether the data directory has world content
+      ansible.builtin.find:
+        paths: "{{ data_dir }}"
+        file_type: any
+      register: data_dir_contents
+
+    - name: Check whether a latest backup exists in S3
+      ansible.builtin.command:
+        cmd: aws s3 ls s3://{{ backup_bucket }}/latest.tar.gz
+      register: latest_backup_check
+      failed_when: false
+      changed_when: false
+
+    - name: Restore world from S3 latest backup
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cd /tmp
+        aws s3 cp s3://{{ backup_bucket }}/latest.tar.gz ./latest.tar.gz
+        tar -xzf latest.tar.gz -C {{ data_dir }}
+        rm -f latest.tar.gz
+      when:
+        - data_dir_contents.matched == 0
+        - latest_backup_check.rc == 0
+      register: restore_result
+
+    - name: Log restore outcome
+      ansible.builtin.debug:
+        msg: >-
+          {% if restore_result.changed | default(false) %}
+          Restored world from s3://{{ backup_bucket }}/latest.tar.gz
+          {% elif data_dir_contents.matched > 0 %}
+          Skipped restore: data dir already populated ({{ data_dir_contents.matched }} entries)
+          {% else %}
+          Skipped restore: no backup in S3, server will generate a fresh world
+          {% endif %}
+
+    - name: Install the backup script
+      ansible.builtin.copy:
+        dest: "{{ backup_script_path }}"
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Snapshot the Minecraft world directory and push to S3.
+          # Uploads both a timestamped artifact (for history) and a
+          # `latest.tar.gz` (for the restore path to find on next boot).
+          set -euo pipefail
+
+          DATA_DIR="{{ data_dir }}"
+          BUCKET="{{ backup_bucket }}"
+          STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+          ARCHIVE="/tmp/minecraft-${STAMP}.tar.gz"
+
+          # Flush in-memory writes to disk before snapshotting.
+          # If the container has rcon enabled this could call save-all flush,
+          # but plain sync is sufficient for a basic backup.
+          sync
+
+          tar -czf "${ARCHIVE}" -C "${DATA_DIR}" .
+
+          aws s3 cp "${ARCHIVE}" "s3://${BUCKET}/minecraft-${STAMP}.tar.gz"
+          aws s3 cp "${ARCHIVE}" "s3://${BUCKET}/latest.tar.gz"
+
+          rm -f "${ARCHIVE}"
+
+          echo "Backup complete: s3://${BUCKET}/minecraft-${STAMP}.tar.gz"
+
+    - name: Schedule the backup script (hourly)
+      ansible.builtin.cron:
+        name: "minecraft world backup"
+        minute: "0"
+        job: "{{ backup_script_path }} >> /var/log/minecraft-backup.log 2>&1"
+
+    - name: Run the Minecraft server container
+      community.docker.docker_container:
+        name: minecraft
+        image: "{{ ecr_registry }}/{{ ecr_repository }}:{{ image_tag }}"
+        state: started
+        restart_policy: unless-stopped
+        pull: true
+        ports:
+          - "25565:25565"
+        env:
+          EULA: "TRUE"
+          VERSION: "{{ minecraft_version }}"
+          MEMORY: "{{ minecraft_memory }}"
+          MOTD: "{{ minecraft_motd }}"
+        volumes:
+          - "{{ data_dir }}:/data"

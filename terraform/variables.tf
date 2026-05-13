@@ -8,3 +8,9 @@ variable "ssh_allowed_cidr" {
   type        = string
   default     = "0.0.0.0/0"
 }
+
+variable "instance_type" {
+  description = "EC2 instance type. t3.small (2 GB RAM) is the smallest size with enough headroom for a JVM + OS + Docker."
+  type        = string
+  default     = "t3.small"
+}
