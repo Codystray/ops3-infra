@@ -1,6 +1,6 @@
 output "ecr_repository_url" {
-  description = "ECR repository URL: use this in the GitHub Actions workflow"
-  value       = aws_ecr_repository.minecraft.repository_url
+  description = "ECR repository URL (managed outside Terraform; read via data source)"
+  value       = data.aws_ecr_repository.minecraft.repository_url
 }
 
 output "instance_public_ip" {
@@ -19,6 +19,6 @@ output "ssh_command" {
 }
 
 output "backup_bucket_name" {
-  description = "S3 bucket holding Minecraft world backups"
-  value       = aws_s3_bucket.backups.id
+  description = "S3 bucket holding Minecraft world backups (managed outside Terraform; read via data source)"
+  value       = data.aws_s3_bucket.backups.id
 }

@@ -1,0 +1,4 @@
+# Copy this file to terraform.tfvars (make sure it's gitignored) and fill in
+# your values so you don't have to type them for every terraform command.
+key_name      = "your-key-pair-name"
+backup_bucket = "ops3-minecraft-backups-<your-account-id>"

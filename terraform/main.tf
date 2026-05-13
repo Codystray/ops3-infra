@@ -55,17 +55,12 @@ resource "aws_security_group" "minecraft" {
   }
 }
 
-resource "aws_ecr_repository" "minecraft" {
-  name                 = "ops3-minecraft-server"
-  image_tag_mutability = "MUTABLE"
+data "aws_ecr_repository" "minecraft" {
+  name = "ops3-minecraft-server"
+}
 
-  image_scanning_configuration {
-    scan_on_push = false
-  }
-
-  tags = {
-    Name = "ops3-minecraft-server"
-  }
+data "aws_s3_bucket" "backups" {
+  bucket = var.backup_bucket
 }
 
 data "aws_ami" "ubuntu" {
@@ -114,49 +109,51 @@ resource "aws_instance" "minecraft" {
   }
 }
 
-data "aws_caller_identity" "current" {}
+resource "local_file" "ansible_inventory" {
+  filename        = "${path.module}/../ansible/inventory.ini"
+  file_permission = "0644"
 
-resource "aws_s3_bucket" "backups" {
-  bucket        = "ops3-minecraft-backups-${data.aws_caller_identity.current.account_id}"
-  force_destroy = true
-
-  tags = {
-    Name = "ops3-minecraft-backups"
-  }
+  content = <<-EOF
+    [minecraft]
+    mc ansible_host=${aws_instance.minecraft.public_ip} ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/cs312-key.pem
+  EOF
 }
 
-resource "aws_s3_bucket_public_access_block" "backups" {
-  bucket = aws_s3_bucket.backups.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-resource "aws_s3_bucket_versioning" "backups" {
-  bucket = aws_s3_bucket.backups.id
-
-  versioning_configuration {
-    status = "Enabled"
+resource "null_resource" "ansible_provision" {
+  triggers = {
+    instance_id     = aws_instance.minecraft.id
+    playbook_sha256 = filesha256("${path.module}/../ansible/playbook.yml")
   }
-}
 
-resource "aws_s3_bucket_lifecycle_configuration" "backups" {
-  bucket = aws_s3_bucket.backups.id
-
-  rule {
-    id     = "expire-old-backups"
-    status = "Enabled"
-
-    filter {}
-
-    expiration {
-      days = 7
-    }
-
-    noncurrent_version_expiration {
-      noncurrent_days = 7
-    }
+  # Wait for SSH to come up, then wait for cloud-init to finish so Python 3
+  # is installed before Ansible tries to connect.
+  provisioner "local-exec" {
+    command = <<-EOT
+      for i in $(seq 1 30); do
+        if ssh -o StrictHostKeyChecking=no \
+               -o UserKnownHostsFile=/dev/null \
+               -o ConnectTimeout=5 \
+               -i ~/.ssh/cs312-key.pem \
+               ubuntu@${aws_instance.minecraft.public_ip} \
+               'cloud-init status --wait' 2>/dev/null; then
+          echo "Host is ready after $((i*10)) seconds."
+          exit 0
+        fi
+        echo "Waiting for SSH on ${aws_instance.minecraft.public_ip} (attempt $i/30)..."
+        sleep 10
+      done
+      echo "Host never became reachable on SSH after 300 seconds."
+      exit 1
+    EOT
   }
+
+  # Run the playbook.
+  provisioner "local-exec" {
+    working_dir = "${path.module}/../ansible"
+    command     = "ansible-playbook playbook.yml"
+  }
+
+  depends_on = [
+    local_file.ansible_inventory,
+  ]
 }

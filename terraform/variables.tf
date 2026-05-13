@@ -14,3 +14,8 @@ variable "instance_type" {
   type        = string
   default     = "t3.small"
 }
+
+variable "backup_bucket" {
+  description = "Name of the externally-managed S3 bucket holding world backups (created via AWS CLI; see RUNBOOK)."
+  type        = string
+}

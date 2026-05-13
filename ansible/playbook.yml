@@ -108,7 +108,7 @@
 
     - name: Restore world from S3 latest backup
       ansible.builtin.shell: |
-        set -euo pipefail
+        set -eu
         cd /tmp
         aws s3 cp s3://{{ backup_bucket }}/latest.tar.gz ./latest.tar.gz
         tar -xzf latest.tar.gz -C {{ data_dir }}
